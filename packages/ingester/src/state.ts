@@ -4,6 +4,8 @@ import type { Client } from "xrpl";
 import type { WatchedEnvironment } from "./subscriber.js";
 import type { DecodedTransaction } from "./decode.js";
 
+const LSF_LOAN_DEFAULTED = 0x00010000;
+
 // Project the current vault/loan/broker/credential state for a setup, as derived from the captured
 // stream. The event tells us which object changed; its authoritative current value is read from the
 // validated ledger and stored as integer base units, so the derived "what is true now" matches the
@@ -24,6 +26,9 @@ export async function projectState(
     case "LoanDelete":
       await projectVault(db, client, env, owner, tx.ledgerIndex);
       await projectBroker(db, client, env, owner, tx.ledgerIndex);
+      await projectLoan(db, tx, tx.ledgerIndex, env);
+      break;
+    case "LoanManage":
       await projectLoan(db, tx, tx.ledgerIndex, env);
       break;
     case "LoanBrokerSet":
@@ -99,12 +104,14 @@ async function projectLoan(db: PrismaClient, tx: DecodedTransaction, ledger: num
       continue;
     }
     const fields = node.fields;
-    const status = Number(fields.PaymentRemaining ?? 0) <= 0 ? "repaid" : "active";
+    const paymentRemaining = Number(fields.PaymentRemaining ?? 0);
+    const defaulted = (Number(fields.Flags ?? 0) & LSF_LOAN_DEFAULTED) !== 0;
+    const status = defaulted ? "defaulted" : paymentRemaining <= 0 ? "repaid" : "active";
     const data = {
       status,
       principalOutstanding: toBaseUnits(fields.PrincipalOutstanding, 6),
       totalOutstanding: toBaseUnits(fields.TotalValueOutstanding, 6),
-      paymentRemaining: Number(fields.PaymentRemaining ?? 0),
+      paymentRemaining,
       updatedLedger: ledger,
     };
     await db.loanState.upsert({
@@ -133,11 +140,13 @@ function readAffectedNodes(meta: unknown): AffectedNode[] {
     const deleted = (entry as { DeletedNode?: RawNode }).DeletedNode;
     const node = created ?? modified ?? deleted;
     if (!node) continue;
+    const fields = created ? node.NewFields : modified ? node.FinalFields : {};
+    if (!fields) continue;
     out.push({
       entryType: node.LedgerEntryType ?? "",
       ...(node.LedgerIndex ? { loanId: node.LedgerIndex } : {}),
       deleted: Boolean(deleted),
-      fields: node.NewFields ?? node.FinalFields ?? node.PreviousFields ?? {},
+      fields,
     });
   }
   return out;
@@ -148,7 +157,6 @@ interface RawNode {
   LedgerIndex?: string;
   NewFields?: Record<string, unknown>;
   FinalFields?: Record<string, unknown>;
-  PreviousFields?: Record<string, unknown>;
 }
 
 async function projectCredential(db: PrismaClient, env: WatchedEnvironment, tx: DecodedTransaction): Promise<void> {
